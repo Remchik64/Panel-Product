@@ -1,143 +1,216 @@
 import os
 import json
-from typing import Optional, Dict, List
 from datetime import datetime
-from pymongo import MongoClient
-from redis import Redis
-from tinydb import TinyDB
+from typing import Dict, List, Optional
 import streamlit as st
+from pymongo import MongoClient
+from pymongo.collection import Collection
+import redis
+from bson import ObjectId
 
 class DatabaseManager:
+    _instance = None
+
     def __init__(self):
         # MongoDB подключение
-        self.mongo_client = MongoClient(st.secrets["mongodb"]["uri"])
-        self.db = self.mongo_client[st.secrets["mongodb"]["database"]]
-        
-        # Redis подключение
-        self.redis_client = Redis(
-            host=st.secrets["redis"]["host"],
-            port=st.secrets["redis"]["port"],
-            password=st.secrets["redis"]["password"],
-            decode_responses=True
+        self.mongo_uri = st.secrets["mongodb"]["uri"]
+        self.mongo_client = MongoClient(
+            self.mongo_uri,
+            username=st.secrets["mongodb"]["username"],
+            password=st.secrets["mongodb"]["password"]
         )
+        self.db = self.mongo_client[st.secrets["mongodb"]["database"]]
         
         # Коллекции MongoDB
         self.users = self.db.users
         self.chat_sessions = self.db.chat_sessions
         self.chat_history = self.db.chat_history
+        self.access_tokens = self.db.access_tokens
         
         # Создаем индексы
-        self._setup_indexes()
+        self._create_indexes()
+        
+        # Redis подключение
+        self.redis_client = redis.Redis(
+            host=st.secrets["redis"]["host"],
+            port=st.secrets["redis"]["port"],
+            password=st.secrets["redis"]["password"],
+            db=st.secrets["redis"]["db"],
+            decode_responses=True
+        )
     
-    def _setup_indexes(self):
-        """Настройка индексов для оптимизации запросов"""
-        self.users.create_index("username", unique=True)
-        self.chat_sessions.create_index([("username", 1), ("flow_id", 1)])
-        self.chat_history.create_index([
-            ("username", 1),
-            ("flow_id", 1),
-            ("session_id", 1)
-        ])
+    def _create_indexes(self):
+        """Создание индексов для оптимизации запросов"""
+        try:
+            # Индексы для пользователей
+            existing_user_indexes = self.users.list_indexes()
+            user_indexes = {idx['name'] for idx in existing_user_indexes}
+            
+            if "username_1" not in user_indexes:
+                self.users.create_index("username", unique=True)
+            if "email_1" not in user_indexes:
+                self.users.create_index("email", unique=True)
+            
+            # Индексы для сессий
+            existing_session_indexes = self.chat_sessions.list_indexes()
+            session_indexes = {idx['name'] for idx in existing_session_indexes}
+            
+            if "username_1_flow_id_1_session_id_1" not in session_indexes:
+                self.chat_sessions.create_index([
+                    ("username", 1),
+                    ("flow_id", 1),
+                    ("session_id", 1)
+                ], unique=True)
+            
+            # Индексы для истории чата
+            existing_history_indexes = self.chat_history.list_indexes()
+            history_indexes = {idx['name'] for idx in existing_history_indexes}
+            
+            if "username_1_flow_id_1_session_id_1" not in history_indexes:
+                self.chat_history.create_index([
+                    ("username", 1),
+                    ("flow_id", 1),
+                    ("session_id", 1)
+                ])
+            
+            # Индекс для токенов
+            existing_token_indexes = self.access_tokens.list_indexes()
+            token_indexes = {idx['name'] for idx in existing_token_indexes}
+            
+            if "token_1" not in token_indexes:
+                self.access_tokens.create_index("token", unique=True)
+            
+        except Exception as e:
+            print(f"Ошибка при создании индексов: {str(e)}")
+            # Не прерываем работу приложения при ошибке создания индексов
     
     def get_user(self, username: str) -> Optional[Dict]:
-        """Получение данных пользователя"""
-        return self.users.find_one({"username": username})
+        """Получение данных пользователя с кэшированием"""
+        cache_key = f"user:{username}"
+        
+        # Пробуем получить из кэша
+        cached_user = self.redis_client.get(cache_key)
+        if cached_user:
+            return json.loads(cached_user)
+        
+        # Если нет в кэше, получаем из MongoDB
+        user = self.users.find_one({"username": username})
+        if user:
+            # Кэшируем на 5 минут
+            self.redis_client.setex(cache_key, 300, json.dumps(user, default=str))
+        return user
     
-    def update_user(self, username: str, data: Dict):
-        """Обновление данных пользователя"""
-        self.users.update_one(
-            {"username": username},
-            {"$set": data},
-            upsert=True
-        )
-    
-    def get_chat_sessions(self, username: str, flow_id: str) -> List[Dict]:
-        """Получение сессий чата"""
-        return list(self.chat_sessions.find({
-            "username": username,
-            "flow_id": flow_id
-        }))
-    
-    def save_chat_history(self, username: str, flow_id: str, session_id: str, messages: List[Dict]):
-        """Сохранение истории чата"""
-        self.chat_history.update_one(
-            {
-                "username": username,
-                "flow_id": flow_id,
-                "session_id": session_id
-            },
-            {
-                "$set": {
-                    "messages": messages,
-                    "updated_at": datetime.now()
-                }
-            },
-            upsert=True
-        )
+    def update_user(self, username: str, update_data: Dict) -> bool:
+        """Обновление данных пользователя с инвалидацией кэша"""
+        try:
+            result = self.users.update_one(
+                {"username": username},
+                {"$set": update_data}
+            )
+            
+            # Инвалидируем кэш
+            self.redis_client.delete(f"user:{username}")
+            
+            return result.modified_count > 0
+        except Exception as e:
+            print(f"Ошибка при обновлении пользователя: {str(e)}")
+            return False
     
     def get_chat_history(self, username: str, flow_id: str, session_id: str) -> List[Dict]:
-        """Получение истории чата"""
+        """Получение истории чата с кэшированием"""
+        cache_key = f"chat_history:{username}:{flow_id}:{session_id}"
+        
+        # Пробуем получить из кэша
+        cached_history = self.redis_client.get(cache_key)
+        if cached_history:
+            return json.loads(cached_history)
+        
+        # Если нет в кэше, получаем из MongoDB
         history = self.chat_history.find_one({
             "username": username,
             "flow_id": flow_id,
             "session_id": session_id
         })
-        return history.get("messages", []) if history else []
+        
+        messages = history.get("messages", []) if history else []
+        
+        # Кэшируем на 1 минуту
+        self.redis_client.setex(cache_key, 60, json.dumps(messages, default=str))
+        
+        return messages
     
-    def cache_set(self, key: str, value: str, expire: int = 3600):
-        """Сохранение данных в Redis"""
-        self.redis_client.set(key, value, ex=expire)
+    def save_chat_history(self, username: str, flow_id: str, session_id: str, messages: List[Dict]) -> bool:
+        """Сохранение истории чата с обновлением кэша"""
+        try:
+            self.chat_history.update_one(
+                {
+                    "username": username,
+                    "flow_id": flow_id,
+                    "session_id": session_id
+                },
+                {
+                    "$set": {
+                        "messages": messages,
+                        "updated_at": datetime.now()
+                    }
+                },
+                upsert=True
+            )
+            
+            # Обновляем кэш
+            cache_key = f"chat_history:{username}:{flow_id}:{session_id}"
+            self.redis_client.setex(cache_key, 60, json.dumps(messages, default=str))
+            
+            return True
+        except Exception as e:
+            print(f"Ошибка при сохранении истории: {str(e)}")
+            return False
     
-    def cache_get(self, key: str) -> Optional[str]:
-        """Получение данных из Redis"""
-        return self.redis_client.get(key)
+    def cache_set(self, key: str, value: any, expire: int = 300):
+        """Сохранение данных в кэш"""
+        try:
+            self.redis_client.setex(key, expire, json.dumps(value, default=str))
+            return True
+        except Exception as e:
+            print(f"Ошибка при сохранении в кэш: {str(e)}")
+            return False
+    
+    def cache_get(self, key: str) -> any:
+        """Получение данных из кэша"""
+        try:
+            data = self.redis_client.get(key)
+            return json.loads(data) if data else None
+        except Exception as e:
+            print(f"Ошибка при получении из кэша: {str(e)}")
+            return None
+    
+    def clear_user_cache(self, username: str):
+        """Очистка всего кэша пользователя"""
+        try:
+            # Удаляем кэш пользователя
+            self.redis_client.delete(f"user:{username}")
+            
+            # Удаляем кэш истории чатов
+            pattern = f"chat_history:{username}:*"
+            keys = self.redis_client.keys(pattern)
+            if keys:
+                self.redis_client.delete(*keys)
+            
+            return True
+        except Exception as e:
+            print(f"Ошибка при очистке кэша: {str(e)}")
+            return False
+    
+    def __del__(self):
+        """Закрытие соединений при удалении объекта"""
+        try:
+            self.mongo_client.close()
+            self.redis_client.close()
+        except:
+            pass
 
-def migrate_from_tinydb():
-    """Функция для миграции данных из TinyDB в MongoDB"""
-    db_manager = DatabaseManager()
-    
-    # Путь к файлу TinyDB
-    tinydb_path = os.path.join(os.path.dirname(__file__), '..', '..', 'user_database.json')
-    old_db = TinyDB(tinydb_path)
-    
-    # Миграция пользователей
-    for user in old_db.all():
-        username = user.get('username')
-        if username:
-            # Обновляем формат данных если нужно
-            user['migrated_at'] = datetime.now()
-            db_manager.update_user(username, user)
-    
-    # Миграция историй чатов
-    chat_history_dir = os.path.join(os.path.dirname(__file__), '..', '..', 'chat_history')
-    if os.path.exists(chat_history_dir):
-        for filename in os.listdir(chat_history_dir):
-            if filename.endswith('.json'):
-                try:
-                    # Парсим имя файла для получения данных
-                    parts = filename[:-5].split('_')
-                    if len(parts) >= 3:
-                        username = parts[0]
-                        flow_id = parts[1]
-                        session_id = '_'.join(parts[2:])
-                        
-                        # Читаем историю из файла
-                        with open(os.path.join(chat_history_dir, filename), 'r', encoding='utf-8') as f:
-                            messages = json.load(f)
-                            
-                        # Сохраняем в MongoDB
-                        db_manager.save_chat_history(username, flow_id, session_id, messages)
-                except Exception as e:
-                    print(f"Ошибка при миграции файла {filename}: {str(e)}")
-    
-    print("Миграция завершена успешно!")
-
-# Singleton instance
-_instance = None
-
-def get_database():
+def get_database() -> DatabaseManager:
     """Получение единственного экземпляра DatabaseManager"""
-    global _instance
-    if _instance is None:
-        _instance = DatabaseManager()
-    return _instance 
+    if not DatabaseManager._instance:
+        DatabaseManager._instance = DatabaseManager()
+    return DatabaseManager._instance 

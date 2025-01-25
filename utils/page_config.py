@@ -1,6 +1,7 @@
 from st_pages import Page, show_pages, add_page_title
 import streamlit as st
 import os
+from utils.database.database_manager import get_database
 
 # Словарь с настройками страниц
 PAGE_CONFIG = {
@@ -15,9 +16,10 @@ PAGE_CONFIG = {
         "name": "Ввод/Покупка ключа",
         "icon": "🔑",
         "order": 2,
-        "show_when_authenticated": True
+        "show_when_authenticated": True,
+        "show_in_menu": True
     },
-      "simple_chat": {
+    "simple_chat": {
         "name": "Бесплатный чат",
         "icon": "💬",
         "order": 3,
@@ -25,29 +27,34 @@ PAGE_CONFIG = {
         "show_in_menu": True
     },
     "app": {
-          "name": "Поисковый отдел",
+        "name": "Поисковый отдел",
         "icon": "🔍",
         "order": 4,
-        "show_when_authenticated": True
-    }, 
+        "show_when_authenticated": True,
+        "show_in_menu": True,
+        "requires_token": True
+    },
     "new_chat": {
         "name": "Личный помощник",
         "icon": "💭",
         "order": 5,
         "show_when_authenticated": True,
-        "show_in_menu": True
+        "show_in_menu": True,
+        "requires_token": True
     },
     "profile": {
         "name": "Профиль",
         "icon": "👤",
         "order": 6,
-        "show_when_authenticated": True
+        "show_when_authenticated": True,
+        "show_in_menu": True
     },
     "admin/generate_tokens": {
         "name": "Генерация ключей",
         "icon": "🔑",
         "order": 7,
         "show_when_authenticated": True,
+        "show_in_menu": True,
         "admin_only": True
     },
     "admin/memory": {
@@ -60,10 +67,10 @@ PAGE_CONFIG = {
 }
 
 def setup_pages():
+    """Настройка страниц приложения"""
     pages_to_show = []
     is_authenticated = st.session_state.get("authenticated", False)
     is_admin = st.session_state.get("is_admin", False)
-    has_flowise_key = st.session_state.get("flowise_api_key", None)
     
     # Показываем страницу регистрации только если пользователь не аутентифицирован
     if not is_authenticated:
@@ -77,8 +84,9 @@ def setup_pages():
             continue
             
         should_show = (
-            (is_authenticated and config["show_when_authenticated"] and
-             (not config.get("admin_only") or (config.get("admin_only") and is_admin)))
+            is_authenticated and 
+            config["show_when_authenticated"] and
+            (not config.get("admin_only", False) or is_admin)
         )
         
         if should_show and config.get("show_in_menu", True):
@@ -89,3 +97,17 @@ def setup_pages():
                 )
     
     show_pages(pages_to_show)
+
+def check_token_access():
+    """Проверка доступа к функционалу, требующему токен"""
+    if not st.session_state.get("authenticated", False):
+        st.warning("Пожалуйста, войдите в систему")
+        st.switch_page("pages/registr.py")
+        st.stop()
+        
+    db = get_database()
+    user = db.get_user(st.session_state.get("username"))
+    if not user or not user.get("active_token"):
+        st.warning("Для использования этой функции необходим активный ключ")
+        st.switch_page("pages/key_input.py")
+        st.stop()

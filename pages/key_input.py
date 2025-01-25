@@ -39,43 +39,56 @@ st.title("Ввод токена")
 # Поле для ввода токена
 access_token = st.text_input("Вставьте токен доступа (например: b99176c5-8bca-4be9-b066-894e4103f32c)")
 
-# Загрузка ключей доступа из Redis
-def load_access_keys():
-    """Загрузка ключей доступа из Redis"""
-    keys_data = db.cache_get("access_keys")
-    if keys_data:
-        return json.loads(keys_data)
-    return {}
-
-# Добавить функцию проверки токена
-def verify_token(token, username):
+def verify_token(token: str, username: str) -> tuple[bool, str]:
+    """Проверка и активация токена"""
     # Получаем данные пользователя
     user = db.get_user(username)
-    
     if not user:
         return False, "Пользователь не найден"
     
-    # Проверка использования токена
+    # Проверка существования и использования токена
+    token_data = db.access_tokens.find_one({"token": token})
+    if not token_data:
+        return False, "Недействительный токен"
+    
+    if token_data.get("used", False):
+        return False, "Токен уже использован"
+    
+    # Проверка использования токена другим пользователем
     existing_user = db.users.find_one({"active_token": token})
     if existing_user and existing_user['username'] != username:
         return False, "Токен уже используется другим пользователем"
     
-    # Проверяем токен в Redis
-    access_keys = load_access_keys()
-    if token in access_keys:
-        # Получаем количество генераций для данного токена
-        generations = access_keys.get(token, {}).get("generations", 500)
+    # Активируем токен
+    try:
+        # Обновляем статус токена
+        db.access_tokens.update_one(
+            {"token": token},
+            {
+                "$set": {
+                    "used": True,
+                    "activated_at": datetime.now(),
+                    "activated_by": username
+                }
+            }
+        )
         
         # Обновляем данные пользователя
-        db.update_user(username, {
-            'active_token': token,
-            'remaining_generations': generations,
-            'token_activated_at': datetime.now()
-        })
+        db.users.update_one(
+            {"username": username},
+            {
+                "$set": {
+                    "active_token": token,
+                    "remaining_generations": token_data["generations"],
+                    "token_activated_at": datetime.now()
+                }
+            }
+        )
         
-        return True, "Токен активирован"
-    
-    return False, "Недействительный токен"
+        return True, "Токен успешно активирован"
+    except Exception as e:
+        print(f"Ошибка при активации токена: {e}")
+        return False, "Ошибка при активации токена"
 
 # Проверка токена
 if st.button("Активировать токен"):

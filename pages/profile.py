@@ -144,6 +144,24 @@ chat_bot_html = """
 """
 
 def main():
+    # Боковое меню
+    with st.sidebar:
+        st.title("Меню")
+        
+        # Кнопка выхода
+        if st.button("🚪 Выйти", use_container_width=True):
+            # Очищаем состояние сессии
+            for key in st.session_state.keys():
+                del st.session_state[key]
+            switch_page("Вход")
+        
+        # Добавляем разделитель
+        st.markdown("---")
+        
+        # Чат с поддержкой
+        st.subheader("💬 Чат с поддержкой")
+        components.html(chat_bot_html, height=700)
+
     # Получаем данные пользователя
     user_data = db.get_user(st.session_state.username)
     if not user_data:

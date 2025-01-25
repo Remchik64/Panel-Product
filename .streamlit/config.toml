@@ -5,12 +5,27 @@ font="monospace"
 
 [server]
 enableXsrfProtection=false
-port = 80
+port = 8501
+address = "192.168.1.69"
+headless = true
+enableCORS = false
+maxUploadSize = 200
+enableWebsocketCompression = true
+
+[browser]
+serverAddress = "192.168.1.69"
+serverPort = 8501
+gatherUsageStats = false
 
 [runner]
-fastReruns=true
+fastReruns = true
 
 [client]
-toolbarMode="auto"
+toolbarMode = "auto"
+showErrorDetails = true
+
+[logger]
+level = "info"
+messageFormat = "%(asctime)s %(message)s"
 
 
