@@ -1,0 +1,16 @@
+[theme]
+base="dark"
+primaryColor="#0ac398"
+font="monospace"
+
+[server]
+enableXsrfProtection=false
+port = 80
+
+[runner]
+fastReruns=true
+
+[client]
+toolbarMode="auto"
+
+
