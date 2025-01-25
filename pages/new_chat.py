@@ -86,7 +86,7 @@ setup_pages()
 # Проверка аутентификации
 if "authenticated" not in st.session_state or not st.session_state.authenticated:
     st.warning("Пожалуйста, войдите в систему")
-    st.switch_page("pages/registr.py")
+    st.switch_page("registr.py")
     st.stop()
 
 # Проверка конфигурации Flowise
@@ -173,15 +173,38 @@ def load_session_history(username: str, flow_id: str, session_id: str) -> list:
 
 def get_available_sessions(username: str, flow_id: str) -> list:
     """Получает список доступных сессий для чата"""
-    sessions = list(db.chat_sessions.find({
+    # Сначала получаем основную сессию
+    primary_session = db.chat_sessions.find_one({
         "username": username,
-        "flow_id": flow_id
+        "flow_id": flow_id,
+        "is_primary": True
+    })
+    
+    # Затем получаем все остальные сессии
+    other_sessions = list(db.chat_sessions.find({
+        "username": username,
+        "flow_id": flow_id,
+        "is_primary": {"$ne": True}
     }).sort("created_at", 1))
     
-    return [{
+    sessions = []
+    
+    # Добавляем основную сессию первой
+    if primary_session:
+        sessions.append({
+            'id': primary_session['session_id'],
+            'display_name': primary_session.get('name', "Основная сессия"),
+            'is_primary': True
+        })
+    
+    # Добавляем остальные сессии
+    sessions.extend([{
         'id': session['session_id'],
-        'display_name': session.get('name', f"Сессия {session['session_id'][:8]}")
-    } for session in sessions]
+        'display_name': session.get('name', f"Сессия {session['session_id'][:8]}"),
+        'is_primary': False
+    } for session in other_sessions])
+    
+    return sessions
 
 def rename_session(username: str, flow_id: str, session_id: str, new_name: str):
     """Переименовывает сессию"""
@@ -207,8 +230,19 @@ def rename_session(username: str, flow_id: str, session_id: str, new_name: str):
         return False
 
 def delete_session(username: str, flow_id: str, session_id: str):
-    """Удаляет сессию полностью"""
+    """Удаляет сессию"""
     try:
+        # Проверяем, не является ли сессия основной
+        session = db.chat_sessions.find_one({
+            "username": username,
+            "flow_id": flow_id,
+            "session_id": session_id
+        })
+        
+        if session and session.get('is_primary'):
+            st.error("Основная сессия не может быть удалена")
+            return False
+        
         # Удаляем сессию
         db.chat_sessions.delete_one({
             "username": username,
@@ -223,26 +257,27 @@ def delete_session(username: str, flow_id: str, session_id: str):
             "session_id": session_id
         })
         
-        # Если удалена текущая сессия, переключаемся на первую доступную
+        # Если удалена текущая сессия, переключаемся на основную сессию
         if ('current_chat_flow' in st.session_state and 
             'current_session' in st.session_state.current_chat_flow and 
             st.session_state.current_chat_flow['current_session'] == session_id):
             
-            # Получаем список оставшихся сессий
-            available_sessions = get_available_sessions(username, flow_id)
+            # Находим основную сессию
+            primary_session = db.chat_sessions.find_one({
+                "username": username,
+                "flow_id": flow_id,
+                "is_primary": True
+            })
             
-            if available_sessions:
-                # Переключаемся на первую доступную сессию
-                st.session_state.current_chat_flow['current_session'] = available_sessions[0]['id']
-            else:
-                # Если сессий нет, создаем новую
-                new_session_id = str(uuid.uuid4())
-                st.session_state.current_chat_flow['current_session'] = new_session_id
-                save_session_history(username, flow_id, new_session_id, [])
+            if primary_session:
+                st.session_state.current_chat_flow['current_session'] = primary_session['session_id']
         
         st.rerun()
+        return True
+        
     except Exception as e:
         st.error(f"Ошибка при удалении сессии: {e}")
+        return False
 
 def clear_session_history(username: str, flow_id: str, session_id: str):
     """Очищает историю конкретной сессии"""
@@ -289,68 +324,110 @@ def display_message(message, role):
 
 def save_chat_flow(username, flow_id, flow_name=None):
     """Сохранение нового чат-потока"""
-    if not flow_name:
-        flow_name = f"Чат {datetime.now().strftime('%Y-%m-%d %H:%M')}"
-    
-    # Создаем новую сессию
-    session_id = str(uuid.uuid4())
-    
-    # Сохраняем информацию о чат-потоке
-    db.chat_sessions.insert_one({
-        "username": username,
-        "flow_id": flow_id,
-        "session_id": session_id,
-        "name": flow_name,
-        "created_at": datetime.now(),
-        "updated_at": datetime.now()
-    })
-    
-    # Обновляем данные пользователя
-    db.users.update_one(
-        {"username": username},
-        {
-            "$push": {
-                "chat_flows": {
-                    "id": flow_id,
-                    "name": flow_name,
-                    "created_at": datetime.now(),
-                    "current_session": session_id
+    try:
+        if not flow_name:
+            flow_name = f"Помощник {datetime.now().strftime('%Y-%m-%d %H:%M')}"
+        
+        # Создаем первую сессию
+        session_id = str(uuid.uuid4())
+        
+        # Проверяем существование пользователя
+        user = db.get_user(username)
+        if not user:
+            return False
+        
+        # Проверяем, не существует ли уже такой flow_id
+        existing_flow = next((flow for flow in user.get('chat_flows', []) if flow['id'] == flow_id), None)
+        if existing_flow:
+            return False
+        
+        # Сохраняем информацию о первой сессии
+        db.chat_sessions.insert_one({
+            "username": username,
+            "flow_id": flow_id,
+            "session_id": session_id,
+            "name": "Основная сессия",  # Фиксированное имя для первой сессии
+            "is_primary": True,  # Флаг основной сессии
+            "created_at": datetime.now(),
+            "updated_at": datetime.now()
+        })
+        
+        # Создаем новый чат-поток в списке пользователя
+        new_flow = {
+            "id": flow_id,
+            "name": flow_name,
+            "created_at": datetime.now(),
+            "current_session": session_id
+        }
+        
+        # Обновляем данные пользователя
+        result = db.users.update_one(
+            {"username": username},
+            {
+                "$push": {
+                    "chat_flows": new_flow
                 }
             }
-        }
-    )
-    
-    return True
+        )
+        
+        return result.matched_count > 0
+        
+    except Exception as e:
+        print(f"Ошибка при создании помощника: {str(e)}")
+        return False
 
 def get_user_chat_flows(username):
     """Получение списка чат-потоков пользователя"""
-    user = db.get_user(username)
-    return user.get('chat_flows', []) if user else []
+    try:
+        user = db.get_user(username)
+        if not user:
+            return []
+        
+        chat_flows = user.get('chat_flows', [])
+        
+        # Проверяем и добавляем current_session если его нет
+        for flow in chat_flows:
+            if 'current_session' not in flow:
+                # Ищем существующую сессию
+                session = db.chat_sessions.find_one({
+                    "username": username,
+                    "flow_id": flow['id']
+                })
+                
+                if session:
+                    flow['current_session'] = session['session_id']
+                else:
+                    # Создаем новую сессию
+                    new_session_id = str(uuid.uuid4())
+                    flow['current_session'] = new_session_id
+                    save_session_history(username, flow['id'], new_session_id, [])
+        
+        # Сортируем по дате создания (новые сверху)
+        chat_flows.sort(key=lambda x: x.get('created_at', ''), reverse=True)
+        
+        return chat_flows
+        
+    except Exception as e:
+        print(f"Ошибка при получении списка помощников: {str(e)}")
+        return []
 
 def delete_chat_flow(username, flow_id):
-    """Удаление чат-потока"""
+    """Удаление чат-потока и всех связанных данных"""
     try:
-        # Удаляем все сессии чата
-        db.chat_sessions.delete_many({
-            "username": username,
-            "flow_id": flow_id
-        })
+        # Удаляем все сессии и историю чатов
+        db.chat_sessions.delete_many({"username": username, "flow_id": flow_id})
+        db.chat_history.delete_many({"username": username, "flow_id": flow_id})
         
-        # Удаляем всю историю чата
-        db.chat_history.delete_many({
-            "username": username,
-            "flow_id": flow_id
-        })
-        
-        # Удаляем чат из списка чатов пользователя
-        db.users.update_one(
+        # Удаляем помощника из списка у пользователя
+        result = db.users.update_one(
             {"username": username},
             {"$pull": {"chat_flows": {"id": flow_id}}}
         )
         
-        return True
+        return result.modified_count > 0
+        
     except Exception as e:
-        st.error(f"Ошибка при удалении чата: {e}")
+        print(f"Ошибка при удалении помощника: {str(e)}")
         return False
 
 # Отображение оставшихся генераций
@@ -363,116 +440,145 @@ if user_data:
         st.error("У вас закончились генераций. Пожалуйста, активируйте новый токен.")
         st.stop()
 
-# Управление чат-потоками в боковой панели
-st.sidebar.title("Управление чат-потоками")
-
-# Загрузка файлов
-with st.sidebar.expander("📎 Загрузка файлов", expanded=False):
-    uploaded_files = st.file_uploader(
-        "Загрузите файлы",
-        accept_multiple_files=True,
-        type=['png', 'jpg', 'jpeg', 'pdf', 'doc', 'docx', 'txt']
-    )
-    if uploaded_files:
-        st.success(f"Загружено файлов: {len(uploaded_files)}")
-
-# Выбор существующего чат-потока
-chat_flows = get_user_chat_flows(st.session_state.username)
-if chat_flows:
-    flow_names = [flow['name'] for flow in chat_flows]
+# В боковом меню
+with st.sidebar:
+    st.title("Управление чат-потоками")
     
-    # Определяем текущий индекс
-    current_index = 0
-    if 'current_chat_flow' in st.session_state:
-        try:
-            current_flow_name = st.session_state.current_chat_flow['name']
-            if current_flow_name in flow_names:
-                current_index = flow_names.index(current_flow_name)
-        except:
-            current_index = 0
-    
-    selected_flow_name = st.sidebar.radio(
-        "Выберите чат:",
-        flow_names,
-        index=current_index
-    )
-    
-    selected_flow = next(
-        (flow for flow in chat_flows if flow['name'] == selected_flow_name),
-        chat_flows[0]
-    )
-    
-    # Проверяем, изменился ли выбранный чат
-    if ('current_chat_flow' not in st.session_state or 
-        st.session_state.current_chat_flow['id'] != selected_flow['id']):
-        st.session_state.current_chat_flow = selected_flow
-        if "message_hashes" in st.session_state:
-            del st.session_state.message_hashes
-        st.rerun()
-    
-    # Управление текущим чатом
-    with st.sidebar.expander("⚙️ Управление чатом", expanded=False):
-        # Переименование чата
-        new_chat_name = st.text_input("Новое название чата:", value=selected_flow['name'])
-        if st.button("✏️ Переименовать чат") and new_chat_name != selected_flow['name']:
-            try:
-                # Обновляем имя в списке чатов пользователя
-                result = db.users.update_one(
-                    {
-                        "username": st.session_state.username,
-                        "chat_flows.id": selected_flow['id']
-                    },
-                    {
-                        "$set": {
-                            "chat_flows.$.name": new_chat_name
-                        }
-                    }
-                )
-                
-                if result.modified_count > 0:
-                    st.session_state.current_chat_flow['name'] = new_chat_name
-                    st.success("Чат успешно переименован")
-                    st.rerun()
-                else:
-                    st.error("Не удалось переименовать чат")
-            except Exception as e:
-                st.error(f"Ошибка при переименовании чата: {str(e)}")
+    # Выбор существующего чат-потока
+    chat_flows = get_user_chat_flows(st.session_state.username)
+    if chat_flows:
+        st.subheader("📚 Ваши помощники")
         
-        st.markdown("---")
+        # Создаем словарь для маппинга помощников
+        flow_options = {f"{flow.get('name', 'Без имени')} ({flow['id']})": flow for flow in chat_flows}
         
-        # Удаление чата
-        st.warning("⚠️ Удаление чата")
-        if st.checkbox("Подтвердить удаление"):
-            if st.button("🗑️ Удалить чат", type="primary"):
-                if delete_chat_flow(st.session_state.username, selected_flow['id']):
-                    st.success("Чат успешно удален")
-                    if 'current_chat_flow' in st.session_state:
-                        del st.session_state.current_chat_flow
-                    st.rerun()
-
-# Создание нового чат-потока
-st.sidebar.markdown("---")
-with st.sidebar.expander("Создать новый чат"):
-    new_flow_name = st.text_input("Название чата:")
-    new_flow_id = st.text_input(
-        "ID чат-потока:",
-        help="Введите ID чата или закажите сборку в https://t.me/startintellect"
-    )
-    
-    if st.button("Создать") and new_flow_id:
-        if save_chat_flow(st.session_state.username, new_flow_id, new_flow_name):
-            st.session_state.current_chat_flow = {
-                'id': new_flow_id,
-                'name': new_flow_name or f"Чат {len(chat_flows) + 1}"
-            }
-            st.success("Новый чат создан!")
+        # Определяем текущий выбор
+        current_selection = None
+        if 'current_chat_flow' in st.session_state:
+            current_flow = st.session_state.current_chat_flow
+            current_selection = f"{current_flow.get('name', 'Без имени')} ({current_flow['id']})"
+        
+        selected_option = st.selectbox(
+            "Выберите помощника:",
+            options=list(flow_options.keys()),
+            index=list(flow_options.keys()).index(current_selection) if current_selection in flow_options else 0,
+            key="flow_selector"
+        )
+        
+        # Обновляем текущего помощника при изменении выбора
+        selected_flow = flow_options[selected_option]
+        if ('current_chat_flow' not in st.session_state or 
+            st.session_state.current_chat_flow.get('id') != selected_flow['id']):
+            st.session_state.current_chat_flow = selected_flow
             st.rerun()
+    
+    st.markdown("<hr style='margin: 10px 0px; border: none; height: 1px; background: rgba(250, 250, 250, 0.2);'>", unsafe_allow_html=True)
+    
+    # Создание нового чат-потока
+    with st.expander("✨ Создать нового помощника", expanded=True):
+        new_flow_name = st.text_input("Название помощника:", key="new_flow_name")
+        new_flow_id = st.text_input(
+            "ID помощника:",
+            help="Введите ID чата или закажите сборку в https://t.me/startintellect",
+            key="new_flow_id"
+        )
+        
+        if st.button("Создать", use_container_width=True, key="create_flow_button"):
+            if not new_flow_id:
+                st.error("Введите ID помощника")
+            else:
+                try:
+                    # Создаем нового помощника
+                    if save_chat_flow(st.session_state.username, new_flow_id, new_flow_name):
+                        # Создаем новую сессию
+                        new_session_id = str(uuid.uuid4())
+                        
+                        # Обновляем состояние
+                        st.session_state.current_chat_flow = {
+                            'id': new_flow_id,
+                            'name': new_flow_name or f"Помощник {datetime.now().strftime('%Y-%m-%d %H:%M')}",
+                            'current_session': new_session_id
+                        }
+                        
+                        # Инициализируем пустую историю для новой сессии
+                        save_session_history(
+                            st.session_state.username,
+                            new_flow_id,
+                            new_session_id,
+                            []
+                        )
+                        
+                        st.success("✨ Новый помощник успешно создан!")
+                        time.sleep(1)  # Даем время увидеть сообщение об успехе
+                        st.rerun()
+                    else:
+                        st.error("Не удалось создать помощника")
+                except Exception as e:
+                    st.error(f"Ошибка при создании помощника: {str(e)}")
+    
+    st.markdown("<hr style='margin: 5px 0px; border: none; height: 1px; background: rgba(250, 250, 250, 0.2);'>", unsafe_allow_html=True)
+    
+    # Управление текущим помощником
+    if 'current_chat_flow' in st.session_state:
+        with st.expander("⚙️ Управление помощником", expanded=True):
+            # Переименование помощника
+            new_name = st.text_input("Новое название:", value=st.session_state.current_chat_flow.get('name', ''), key="rename_flow_input")
+            if st.button("✏️ Переименовать", use_container_width=True, key="rename_flow_button") and new_name:
+                try:
+                    # Обновляем имя в списке чатов пользователя
+                    result = db.users.update_one(
+                        {
+                            "username": st.session_state.username,
+                            "chat_flows.id": st.session_state.current_chat_flow['id']
+                        },
+                        {
+                            "$set": {
+                                "chat_flows.$.name": new_name
+                            }
+                        }
+                    )
+                    
+                    if result.modified_count > 0:
+                        st.session_state.current_chat_flow['name'] = new_name
+                        st.success("Помощник успешно переименован")
+                        st.rerun()
+                    else:
+                        st.error("Не удалось переименовать помощника")
+                except Exception as e:
+                    st.error(f"Ошибка при переименовании помощника: {str(e)}")
+            
+            st.markdown("---")
+            
+            # Удаление помощника
+            st.warning("⚠️ Удаление помощника")
+            delete_confirmed = st.checkbox("Подтвердить удаление", key="confirm_delete")
+            if delete_confirmed:
+                if st.button("🗑️ Удалить помощника", type="primary", use_container_width=True, key="delete_flow"):
+                    if delete_chat_flow(st.session_state.username, st.session_state.current_chat_flow['id']):
+                        if 'current_chat_flow' in st.session_state:
+                            del st.session_state.current_chat_flow
+                        st.success("Помощник успешно удален")
+                        st.rerun()
+                    else:
+                        st.error("Не удалось удалить помощника")
+    
+    st.markdown("<hr style='margin: 5px 0px; border: none; height: 1px; background: rgba(250, 250, 250, 0.2);'>", unsafe_allow_html=True)
+    
+    # Загрузка файлов
+    with st.expander("📎 Загрузка файлов", expanded=False):
+        uploaded_files = st.file_uploader(
+            "Загрузите файлы",
+            accept_multiple_files=True,
+            type=["png", "jpg", "jpeg", "pdf", "doc", "docx", "txt"]
+        )
+        if uploaded_files:
+            st.success(f"Загружено файлов: {len(uploaded_files)}")
 
 # Управление текущим чатом
 if 'current_chat_flow' in st.session_state:
     st.title(f"💬 {st.session_state.current_chat_flow['name']}")
     
-    # Управление сессиями
+    # Управление чатами
     available_sessions = get_available_sessions(
         st.session_state.username,
         st.session_state.current_chat_flow['id']
@@ -492,7 +598,7 @@ if 'current_chat_flow' in st.session_state:
             )
             
             selected_display_name = st.selectbox(
-                "Выберите сессию:",
+                "Выберите чат:",
                 display_names,
                 index=display_names.index(current_display_name) if current_display_name in display_names else 0
             )
@@ -521,8 +627,8 @@ if 'current_chat_flow' in st.session_state:
             unsafe_allow_html=True
         )
         
-        # Кнопка новой сессии
-        if st.button("💫 Новая сессия", use_container_width=True):
+        # Кнопка нового чата
+        if st.button("💫 Новый чат", use_container_width=True, key="new_chat_button"):
             new_session_id = str(uuid.uuid4())
             st.session_state.current_chat_flow['current_session'] = new_session_id
             save_session_history(
@@ -533,33 +639,50 @@ if 'current_chat_flow' in st.session_state:
             )
             st.rerun()
         
-        # Кнопка переименования
-        if st.button("✏️ Переименовать", use_container_width=True):
-            new_name = st.text_input("Новое название:", value=selected_display_name, key="rename_session")
-            if new_name and new_name != selected_display_name:
-                rename_session(
-                    st.session_state.username,
-                    st.session_state.current_chat_flow['id'],
-                    selected_session_id,
-                    new_name
-                )
+        # Кнопка переименования чата
+        current_session = st.session_state.current_chat_flow.get('current_session')
+        if current_session:
+            # Получаем информацию о текущей сессии
+            current_session_info = next(
+                (session for session in available_sessions 
+                 if session['id'] == current_session),
+                None
+            )
+            
+            if current_session_info:
+                current_name = current_session_info['display_name']
+                is_primary = current_session_info.get('is_primary', False)
+                
+                # Для основной сессии показываем специальное сообщение
+                if is_primary:
+                    st.info("Основная сессия")
+                
+                if st.button("✏️ Переименовать", use_container_width=True, key="rename_chat_button"):
+                    new_name = st.text_input("Новое название:", value=current_name, key="rename_chat_input")
+                    if new_name and new_name != current_name:
+                        rename_session(
+                            st.session_state.username,
+                            st.session_state.current_chat_flow['id'],
+                            current_session,
+                            new_name
+                        )
         
         # Кнопка очистки
-        if st.button("🧹 Очистить", use_container_width=True):
-            if st.session_state.current_chat_flow.get('current_session'):
+        if st.button("🧹 Очистить", use_container_width=True, key="clear_chat_button"):
+            if current_session:
                 clear_session_history(
                     st.session_state.username,
                     st.session_state.current_chat_flow['id'],
-                    st.session_state.current_chat_flow['current_session']
+                    current_session
                 )
         
-        # Кнопка удаления
-        if st.button("🗑 Удалить", use_container_width=True):
-            if st.session_state.current_chat_flow.get('current_session'):
+        # Кнопка удаления (только для не основных сессий)
+        if current_session_info and not is_primary:
+            if st.button("🗑 Удалить", use_container_width=True, key="delete_chat_button"):
                 delete_session(
                     st.session_state.username,
                     st.session_state.current_chat_flow['id'],
-                    st.session_state.current_chat_flow['current_session']
+                    current_session
                 )
     
     st.markdown("---")
@@ -585,11 +708,11 @@ if 'current_chat_flow' in st.session_state:
     
     col1, col2, col3 = st.columns(3)
     with col1:
-        send_button = st.button("Отправить", use_container_width=True)
+        send_button = st.button("Отправить", use_container_width=True, key="send_message_button")
     with col2:
-        clear_button = st.button("Очистить", on_click=lambda: setattr(st.session_state, 'message_input', ''), use_container_width=True)
+        clear_button = st.button("Очистить", on_click=lambda: setattr(st.session_state, 'message_input', ''), use_container_width=True, key="clear_message_button")
     with col3:
-        cancel_button = st.button("Отменить", on_click=lambda: setattr(st.session_state, 'message_input', ''), use_container_width=True)
+        cancel_button = st.button("Отменить", on_click=lambda: setattr(st.session_state, 'message_input', ''), use_container_width=True, key="cancel_message_button")
     
     if send_button and user_input and user_input.strip():
         # Проверяем наличие активного токена перед отправкой
