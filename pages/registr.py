@@ -1,12 +1,14 @@
 import streamlit as st
 from streamlit_extras.switch_page_button import switch_page
-from tinydb import TinyDB, Query
 import os
 from PIL import Image
 from utils.page_config import setup_pages, PAGE_CONFIG
-from utils.utils import format_database, get_data_file_path
 from utils.security import hash_password, is_strong_password, verify_password, check_login_attempts, increment_login_attempts, reset_login_attempts
 from datetime import datetime
+from utils.database.database_manager import get_database
+
+# Получаем экземпляр базы данных
+db = get_database()
 
 # Сначала конфигурация страницы
 st.set_page_config(page_title="Вход/Регистрация", layout="wide", initial_sidebar_state="collapsed")
@@ -55,9 +57,6 @@ st.markdown("""
 # Затем настройка страниц
 setup_pages()
 
-# Инициализация базы данных пользователей
-user_db = TinyDB(get_data_file_path('user_database.json'))
-
 # Убедимся, что папка для хранения изображений профиля существует
 PROFILE_IMAGES_DIR = 'profile_images'
 if not os.path.exists(PROFILE_IMAGES_DIR):
@@ -65,10 +64,10 @@ if not os.path.exists(PROFILE_IMAGES_DIR):
 
 # Функция для регистрации пользователя
 def register_user(username, email, password, profile_image_path=None):
-    User = Query()
-    if user_db.search(User.username == username):
+    # Проверяем существование пользователя
+    if db.users.find_one({"username": username}):
         return False, "Пользователь с таким именем уже существует"
-    if user_db.search(User.email == email):
+    if db.users.find_one({"email": email}):
         return False, "Пользователь с таким email уже существует"
         
     # Проверка надежности пароля
@@ -86,23 +85,24 @@ def register_user(username, email, password, profile_image_path=None):
         'profile_image': profile_image_path if profile_image_path else "profile_images/default_user_icon.png",
         'remaining_generations': 0,
         'is_admin': False,
-        'created_at': datetime.now().isoformat()
+        'created_at': datetime.now(),
+        'updated_at': datetime.now()
     }
-    user_db.insert(user_data)
-    format_database()
+    
+    # Сохраняем пользователя в MongoDB
+    db.users.insert_one(user_data)
     return True, "Регистрация успешна"
 
 # Функция для входа в систему
 def login(username, password):
-    User = Query()
-    
     # Проверка попыток входа
     can_login, message = check_login_attempts(username)
     if not can_login:
         st.error(message)
         return False
     
-    user = user_db.get(User.username == username)
+    # Получаем пользователя из MongoDB
+    user = db.users.find_one({"username": username})
     if user and verify_password(password, user['password']):
         st.session_state.authenticated = True
         st.session_state.username = username
@@ -144,8 +144,7 @@ with col2:
                     setup_pages()
                     switch_page(PAGE_CONFIG["key_input"]["name"])
                 elif login(username, password):
-                    User = Query()
-                    user = user_db.get(User.username == username)
+                    user = db.users.find_one({"username": username})
                     st.session_state.authenticated = True 
                     st.session_state.username = username
                     st.session_state.is_admin = user.get('is_admin', False)

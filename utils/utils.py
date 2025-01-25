@@ -7,6 +7,7 @@ from datetime import datetime
 from streamlit.runtime.scriptrunner import add_script_run_ctx
 from streamlit import switch_page
 import streamlit as st
+from utils.database.database_manager import get_database
 
 # Определяем базовый путь для файлов данных
 DATA_DIR = "/data" if os.path.exists("/data") else "."
@@ -32,6 +33,9 @@ ensure_directories()
 # Инициализация базы данных
 user_db = TinyDB(get_data_file_path('user_database.json'))
 User = Query()
+
+# Получаем экземпляр базы данных
+db = get_database()
 
 def check_token_status(username):
     """Проверяет статус токена пользователя"""
@@ -157,7 +161,8 @@ def remove_used_key(used_key):
         return False
 
 def update_remaining_generations(username, remaining):
-    user = user_db.get(User.username == username)
+    """Обновляет количество оставшихся генераций"""
+    user = db.get_user(username)
     
     if not user:
         return False
@@ -171,43 +176,51 @@ def update_remaining_generations(username, remaining):
     
     if new_remaining <= 0:
         if user.get('active_token'):
-            used_key = user['active_token']
+            used_token = user['active_token']
             
-            # Сохраняем токен в список деактивированных
-            save_deactivated_token(used_key)
-            
-            # Удаляем токен из активных
-            remove_used_key(used_key)
+            # Помечаем токен как использованный
+            db.access_tokens.update_one(
+                {"token": used_token},
+                {"$set": {"used": True, "deactivated_at": datetime.now()}}
+            )
             
             # Обновляем данные пользователя
-            user_db.update({
-                'active_token': None,
-                'remaining_generations': 0,
-                'token_generations': 0,
-                'token_deactivated_at': datetime.now().isoformat()
-            }, User.username == username)
+            db.users.update_one(
+                {"username": username},
+                {
+                    "$set": {
+                        "active_token": None,
+                        "remaining_generations": 0,
+                        "token_deactivated_at": datetime.now()
+                    }
+                }
+            )
             
             if 'access_granted' in st.session_state:
                 st.session_state.access_granted = False
                 
-            # Показываем уведомление пользователю
             st.warning("⚠️ Ваш токен был деактивирован из-за окончания генераций. Пожалуйста, активируйте новый токен.")
     else:
-        user_db.update({
-            'remaining_generations': new_remaining,
-            'token_generations': new_remaining,
-            'last_generation_update': datetime.now().isoformat()
-        }, User.username == username)
+        db.users.update_one(
+            {"username": username},
+            {
+                "$set": {
+                    "remaining_generations": new_remaining,
+                    "last_generation_update": datetime.now()
+                }
+            }
+        )
     
     return True
 
 def verify_user_access():
+    """Проверяет доступ пользователя"""
     if "username" not in st.session_state:
         st.warning("Необходима авторизация")
         switch_page("registr")
         return False
     
-    user = user_db.get(User.username == st.session_state.username)
+    user = db.get_user(st.session_state.username)
     if not user or not user.get('active_token'):
         st.warning("Необходим активный токен")
         switch_page("key_input")
@@ -227,13 +240,12 @@ def format_database():
         return False
 
 def generate_unique_token():
+    """Генерирует уникальный токен"""
     return str(uuid.uuid4())
 
 def generate_and_save_token(generations=500):
-    new_token = generate_unique_token()
-    if save_token(new_token, generations):
-        return new_token
-    return None
+    """Генерирует новый токен без сохранения в файл"""
+    return generate_unique_token()
 
 def save_deactivated_token(token):
     """Сохраняет деактивированный токен в отдельный файл"""

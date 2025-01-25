@@ -69,8 +69,7 @@ class ChatDatabase:
             for msg in updated_history:
                 self.add_message(msg["role"], msg["content"])
         except Exception as e:
-            print(f"Ошибка при удалении сообщения: {e}")
-            
+            print(f"Ошибка при удалении сообщения: {e}")            
     def __del__(self):
         """Деструктор для закрытия соединения с базой данных"""
         try:

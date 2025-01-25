@@ -1,9 +1,7 @@
 import streamlit as st
 from streamlit_extras.switch_page_button import switch_page
-from tinydb import TinyDB, Query
 import os
 from PIL import Image
-from utils.utils import check_token_status, format_database, update_remaining_generations, get_data_file_path
 from utils.page_config import setup_pages, PAGE_CONFIG
 import hashlib
 import io
@@ -11,23 +9,34 @@ import mimetypes
 from utils.security import hash_password, is_strong_password
 import requests
 from googletrans import Translator
-from utils.chat_database import ChatDatabase
-from utils.context_manager import ContextManager
 import streamlit.components.v1 as components
+from datetime import datetime
+from utils.database.database_manager import get_database
+
+# Получаем экземпляр базы данных
+db = get_database()
 
 # После импортов
 PROFILE_IMAGES_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'profile_images'))
 if not os.path.exists(PROFILE_IMAGES_DIR):
     os.makedirs(PROFILE_IMAGES_DIR)
 
-chat_db = ChatDatabase(f"{st.session_state.username}_profile_chat")
+def clear_chat_history(username: str, flow_id: str, session_id: str):
+    """Очистка истории чата"""
+    db.chat_history.update_one(
+        {
+            "username": username,
+            "flow_id": flow_id,
+            "session_id": session_id
+        },
+        {
+            "$set": {
+                "messages": [],
+                "updated_at": datetime.now()
+            }
+        }
+    )
 
-def clear_chat_history():
-    chat_db.clear_history()  # Очистка базы данных истории чата
-    if "message_hashes" in st.session_state:
-        del st.session_state["message_hashes"]  # Сброс хэшей сообщений
-
-# После импортов и перед st.set_page_config()
 def is_valid_image(file_content):
     """Проверяет, является ли файл изображением"""
     try:
@@ -135,6 +144,12 @@ chat_bot_html = """
 """
 
 def main():
+    # Получаем данные пользователя
+    user_data = db.get_user(st.session_state.username)
+    if not user_data:
+        st.error("Пользователь не найден")
+        return
+
     st.title(f"Личный кабинет {st.session_state.username}")
 
     # Отображение информации о пользователе
@@ -168,7 +183,12 @@ def main():
                         st.success("Старое изображение успешно удалено.")
                     except Exception as e:
                         st.error(f"Ошибка при удалении файла: {e}")
-            user_db.update({'profile_image': None}, User.username == st.session_state.username)
+            
+            # Обновляем данные пользователя
+            db.update_user(st.session_state.username, {
+                'profile_image': None,
+                'updated_at': datetime.now()
+            })
             st.success("Фотография профиля удалена")
             st.rerun()
     else:
@@ -216,7 +236,12 @@ def main():
             # Проверяем валидность изображения
             img = Image.open(new_profile_image)
             img.verify()
-            updates['profile_image'] = image_path
+            
+            # Обновляем данные пользователя
+            db.update_user(st.session_state.username, {
+                'profile_image': image_path,
+                'updated_at': datetime.now()
+            })
             needs_reload = True
 
         except Exception as e:
@@ -232,7 +257,7 @@ def main():
 
         # Обработка изменения имени пользователя и email
         if new_username and new_username != old_username:
-            existing_user = user_db.get(User.username == new_username)
+            existing_user = db.users.find_one({"username": new_username})
             if existing_user:
                 st.error("Пользователь с таким именем уже существует")
             else:
@@ -248,6 +273,7 @@ def main():
             if new_password != confirm_password:
                 st.error("Пароли не совпадают")
             else:
+                # Проверка надежности пароля
                 is_strong, message = is_strong_password(new_password)
                 if not is_strong:
                     st.error(message)
@@ -255,69 +281,18 @@ def main():
                     updates['password'] = hash_password(new_password)
                     needs_reload = True
 
-        # Применяем все обновления
+        # Если есть обновления, применяем их
         if updates:
-            try:
-                user_db.update(updates, User.username == old_username)
-                format_database()
-                
-                if 'username' in updates:
-                    st.session_state.username = updates['username']
-                
-                st.success("Данные успешно обновлены")
-                if needs_reload:
-                    st.rerun()
-            except Exception as e:
-                st.error(f"Ошибка при обновлении данных: {e}")
-        else:
-            st.info("Нет изменений для обновления")
-
-    # Добавляем разделитель
-    st.markdown("---")
-
-    # Кнопка выхода из аккаунта
-    if st.button("Выйти"):
-        st.session_state.authenticated = False
-        st.session_state.username = None
-        st.session_state.active_token = None
-        st.session_state.remaining_generations = 0
-        st.session_state.is_admin = False
-        setup_pages()
-        switch_page(PAGE_CONFIG["registr"]["name"])
-
-
-    # Чат-бот остается в боковом меню без изменений
-    st.sidebar.markdown( "Чат поддержки(НАХОДИТСЯ В РАЗРАБОТКЕ!) ")
-    with st.sidebar:
-        components.html(
-            chat_bot_html,
-            height=600,
-            width=None,
-            scrolling=False
-        )
+            updates['updated_at'] = datetime.now()
+            db.update_user(old_username, updates)
+            st.success("Данные успешно обновлены")
+            if needs_reload:
+                st.rerun()
 
 if __name__ == "__main__":
-    # Проверка аутентификации
     if "authenticated" not in st.session_state or not st.session_state.authenticated:
-        st.error("Пожалуйста, войдите в систему")
-        setup_pages()
+        st.warning("Пожалуйста, войдите в систему")
         switch_page(PAGE_CONFIG["registr"]["name"])
-        st.stop()
-
-    # Инициализация базы данных пользователей
-    user_db = TinyDB(get_data_file_path('user_database.json'))
-    User = Query()
-    user_data = user_db.search(User.username == st.session_state.username)
-
-    if not user_data:
-        st.error("Пользователь не найден.")
-        st.session_state.authenticated = False
-        st.session_state.username = None
-        st.session_state.is_admin = False
-        st.rerun()
-
-    user_data = user_data[0]
-    
-    # Запускаем основную функцию
-    main()
+    else:
+        main()
 

@@ -31,8 +31,6 @@ wheels/
 .env
 .env.local
 
-
-
 # Streamlit
 .streamlit/secrets.toml
 
@@ -50,12 +48,6 @@ env/
 *.swp
 *.swo
 
-
-
-# Future version (in development)
-future_version/
-future_version/*
-
 # Logs
 *.log
 logs/
@@ -63,3 +55,16 @@ logs/
 # Local development
 .DS_Store
 Thumbs.db
+
+# MongoDB
+*.mongodb
+mongod.lock
+
+# Temporary files
+*.tmp
+*.temp
+*.bak
+
+# Package files
+package-lock.json
+package.json

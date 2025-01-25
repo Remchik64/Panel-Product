@@ -1,11 +1,14 @@
 import streamlit as st
-from utils.utils import generate_and_save_token, get_data_file_path
+from utils.utils import generate_and_save_token
 from utils.page_config import setup_pages
-import os
-import json
+from utils.database.database_manager import get_database
+from datetime import datetime
 
 # Настраиваем страницы
 setup_pages()
+
+# Получаем экземпляр базы данных
+db = get_database()
 
 # Проверка прав администратора
 if not st.session_state.get("is_admin", False):
@@ -23,16 +26,6 @@ if "admin_verified" not in st.session_state:
     
     st.session_state.admin_verified = True
 
-# Проверяем и создаем папку chat если её нет
-chat_dir = os.path.join(os.path.dirname(__file__), '..', '..', 'chat')
-os.makedirs(chat_dir, exist_ok=True)
-
-# Проверяем существование файла
-keys_file = get_data_file_path('access_keys.json')
-if not os.path.exists(keys_file):
-    with open(keys_file, 'w') as f:
-        json.dump({"keys": [], "generations": {}}, f)
-
 st.title("Генерация токенов (Админ панель)")
 
 with st.form("token_generation"):
@@ -43,7 +36,32 @@ with st.form("token_generation"):
 
 if submit:
     for _ in range(num_tokens):
+        # Генерируем новый токен
         new_token = generate_and_save_token(generations)
+        
+        # Сохраняем токен в MongoDB
+        db.access_tokens.insert_one({
+            "token": new_token,
+            "generations": generations,
+            "used": False,
+            "created_at": datetime.now()
+        })
+        
         st.code(new_token)
         st.write(f"Токен успешно создан с {generations} генерациями")
+
+# Отображение существующих токенов
+st.markdown("---")
+st.subheader("Существующие токены")
+
+tokens = list(db.access_tokens.find().sort("created_at", -1))
+if tokens:
+    for token in tokens:
+        col1, col2, col3 = st.columns([2, 1, 1])
+        with col1:
+            st.code(token["token"])
+        with col2:
+            st.write(f"Генераций: {token['generations']}")
+        with col3:
+            st.write("Использован" if token["used"] else "Не использован")
 
